@@ -1,6 +1,13 @@
 # Configure the AWS Provider
 provider "aws" {
   region = "us-east-1"
+  default_tags {
+    tags = {
+      Environment = terraform.workspace
+      Owner       = "Acme"
+      Provisoned  = "Terraform"
+    }
+  }
 }
 
 #Retrieve the list of AZs in the current AWS region
@@ -141,10 +148,31 @@ data "aws_ami" "ubuntu" {
 
 # Terraform Resource Block - To Build EC2 instance in Public Subnet
 resource "aws_instance" "web_server" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t2.micro"
-  subnet_id              = aws_subnet.public_subnets["public_subnet_1"].id
-  vpc_security_group_ids = ["sg-044f7f45e343f46dc"]
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = "t2.micro"
+  subnet_id                   = aws_subnet.public_subnets["public_subnet_1"].id
+  vpc_security_group_ids      = [aws_security_group.vpc-ping.id, aws_security_group.ingress-ssh.id, aws_security_group.vpc-web.id]
+  associate_public_ip_address = true
+  key_name                    = aws_key_pair.generated.key_name
+  connection {
+    user        = "ubuntu"
+    private_key = tls_private_key.generated.private_key_pem
+    host        = self.public_ip
+  }
+
+  #Leave the first part of the block unchanged and create our `local-exec` provisioner
+  provisioner "local-exec" {
+    command = "chmod 600 ${local_file.private_key_pem.filename}"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo rm -rf /tmp",
+      "sudo git clone https://github.com/hashicorp/demo-terraform-101 /tmp",
+      "sudo sh /tmp/assets/setup-web.sh",
+    ]
+  }
+
   tags = {
     Name  = local.server_name
     Owner = local.team
@@ -165,23 +193,138 @@ resource "aws_subnet" "variables-subnet" {
   }
 }
 
-module "subnet_addrs" {
-  source = "hashicorp/subnets/cidr"
-  version = "1.0.0"
+resource "tls_private_key" "generated" {
+  algorithm = "RSA"
+}
 
-  base_cidr_block = "10.0.0.0/22"
-  networks = [
-    {
-      name = "module_network_a"
-      new_bits = 2
-    },
-    {
-      name = "module_network_b"
-      new_bits = 2
-    },
+resource "local_file" "private_key_pem" {
+  content  = tls_private_key.generated.private_key_pem
+  filename = "MyAWSKey.pem"
+}
+
+resource "aws_key_pair" "generated" {
+  key_name   = "MyAWSKey"
+  public_key = tls_private_key.generated.public_key_openssh
+  lifecycle {
+    ignore_changes = [key_name]
+  }
+}
+
+# Security Groups
+resource "aws_security_group" "ingress-ssh" {
+  name   = "allow-all-ssh"
+  vpc_id = aws_vpc.vpc.id
+  ingress {
+    cidr_blocks = ["0.0.0.0/0"]
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+  }
+  // Terraform removes the default rule
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Create Security Group - Web Traffic
+resource "aws_security_group" "vpc-web" {
+  name        = "vpc-web-${terraform.workspace}"
+  vpc_id      = aws_vpc.vpc.id
+  description = "Web Traffic"
+  ingress {
+    description = "Allow Port 80"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    description = "Allow Port 443"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    description = "Allow all ip and ports outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "vpc-ping" {
+  name        = "vpc-ping"
+  vpc_id      = aws_vpc.vpc.id
+  description = "ICMP for Ping Access"
+  ingress {
+    description = "Allow ICMP traffic"
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    description = "Allow all ip and ports outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+module "server" {
+  source    = "./modules/server"
+  ami       = data.aws_ami.ubuntu.id
+  size      = "t2.micro"
+  subnet_id = aws_subnet.public_subnets["public_subnet_3"].id
+  security_groups = [
+    aws_security_group.vpc-ping.id,
+    aws_security_group.ingress-ssh.id,
+    aws_security_group.vpc-web.id
   ]
 }
-output "subnet_addrs" {
-  value = module.subnet_addrs.network_cidr_blocks
+
+module "server_subnet_1" {
+  source      = "./modules/web_server"
+  ami         = data.aws_ami.ubuntu.id
+  key_name    = aws_key_pair.generated.key_name
+  user        = "ubuntu"
+  private_key = tls_private_key.generated.private_key_pem
+  subnet_id   = aws_subnet.public_subnets["public_subnet_1"].id
+  security_groups = [
+    aws_security_group.vpc-ping.id,
+    aws_security_group.ingress-ssh.id,
+    aws_security_group.vpc-web.id
+  ]
+}
+
+output "public_ip" {
+  value = module.server.public_ip
+}
+
+output "public_dns" {
+  value = module.server.public_dns
+}
+
+output "size" {
+  value = module.server.size
+}
+
+output "public_ip_server_subnet_1" {
+  value = module.server_subnet_1.public_ip
+}
+
+module "s3-bucket" {
+  source = "terraform-aws-modules/s3-bucket/aws"
+  version = "3.11.0"
+}
+
+output "s3_bucket_name" {
+  value = module.s3-bucket.s3_bucket_bucket_domain_name
 }
 
